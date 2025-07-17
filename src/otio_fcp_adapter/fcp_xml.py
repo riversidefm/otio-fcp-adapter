@@ -1895,7 +1895,7 @@ def _build_sequence_for_timeline(timeline, timeline_range, br_map):
     sequence_e = _element_with_item_metadata("sequence", timeline)
 
     _add_stack_elements_to_sequence(
-        timeline.tracks, sequence_e, timeline_range, br_map
+        timeline.tracks, sequence_e, timeline_range, br_map, timeline.canvas_size
     )
 
     # In the case of timelines, use the timeline name rather than the stack
@@ -1920,12 +1920,12 @@ def _build_sequence_for_timeline(timeline, timeline_range, br_map):
 def _build_sequence_for_stack(stack, timeline_range, br_map):
     sequence_e = _element_with_item_metadata("sequence", stack)
 
-    _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map)
+    _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map, None)
 
     return sequence_e
 
 
-def _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map):
+def _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map, canvas_size=None):
     _append_new_sub_element(sequence_e, 'name', text=stack.name)
     _append_new_sub_element(
         sequence_e, 'duration',
@@ -1940,7 +1940,12 @@ def _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map):
 
     # This is a fix for Davinci Resolve. After the "video" tag, it expects
     # a <format> tag, even if empty. See issue 839
-    _get_or_create_subelement(video_e, "format")
+    vformat_e = _get_or_create_subelement(video_e, "format")
+
+    if canvas_size:
+        vsubchar_e = _get_or_create_subelement(vformat_e, "samplecharacteristics")
+        _append_new_sub_element(vsubchar_e, "width", text=str(int(canvas_size.x)))
+        _append_new_sub_element(vsubchar_e, "height", text=str(int(canvas_size.y)))
 
     # XXX: Due to the way that backreferences are created later on, the XML
     #      is assumed to have its video tracks serialized before its audio
