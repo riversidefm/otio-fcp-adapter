@@ -9,6 +9,8 @@ import itertools
 import math
 import os
 import re
+import subprocess
+
 from xml.etree import cElementTree
 from xml.dom import minidom
 
@@ -32,6 +34,128 @@ ID_RE = re.compile(r"^(?P<tag>[a-zA-Z]*)-(?P<id>\d*)$")
 # utilities
 # ---------
 
+class FFProbe:
+    def __init__(self, path):
+        self._path = path
+        self._width = 0
+        self._height = 0
+        self._frame_rate = 0
+        self._audio_sample_rate = 0
+        self._audio_channels = 0
+        self._audio_samples = 0
+
+    def has_video(self):
+        return self._width > 0 and self._height > 0 and self._frame_rate > 0
+
+    def has_audio(self):
+        return self._audio_sample_rate > 0 and self._audio_channels > 0
+
+    def is_audio_only(self):
+        return self.has_audio() and not self.has_video()
+
+    def probe(self):
+        """
+        Probe a file using ffprobe and return the frame size, frame rate, and audio information
+        """
+        path = self._path.replace("file://", "")
+        path = urllib_parse.unquote(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
+
+        # Probe video information
+        try:
+            frame_info = subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=height,width,r_frame_rate",
+                    "-of",
+                    "csv=s=x:p=0",
+                    path
+                ]
+            ).decode("utf-8")
+        except (subprocess.CalledProcessError, OSError) as e:
+            # Video probe failed, but file might still have audio
+            frame_info = ""
+
+        if frame_info:
+            frame_info = frame_info.strip()
+            frame_info_parts = frame_info.split('x')
+
+            if len(frame_info_parts) == 3:
+                self._width = int(frame_info_parts[0])
+                self._height = int(frame_info_parts[1])
+                self._frame_rate = Fraction(frame_info_parts[2])
+
+        # Probe audio information
+        try:
+            audio_info = subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=sample_rate,channels,duration_ts",
+                    "-of",
+                    "csv=s=x:p=0",
+                    path
+                ]
+            ).decode("utf-8")
+        except (subprocess.CalledProcessError, OSError) as e:
+            # Audio probe failed
+            audio_info = ""
+
+        if audio_info:
+            audio_info = audio_info.strip()
+            audio_info_parts = audio_info.split('x')
+
+            if len(audio_info_parts) == 3:
+                self._audio_sample_rate = int(audio_info_parts[0])
+                self._audio_channels = int(audio_info_parts[1])
+                self._audio_samples = int(audio_info_parts[2])
+
+        # Check that we found at least video or audio
+        if not self.has_video() and not self.has_audio():
+            raise RuntimeError(f"No video or audio information found: {self._path}")
+
+    def format_name(self):
+        """
+        Helper to get the formatName used in FCP X XML format elements. This
+        uses ffprobe to get the frame size of the the clip at the provided path.
+
+        Returns:
+            str: The format name. If empty, then ffprobe couldn't find the item
+        """
+        if self.has_video():
+            return f"FFVideoFormat{self._height}p{int(self._frame_rate)}"
+        else:
+            return ""
+
+    @property
+    def width(self):
+        return self._width
+
+    @property
+    def height(self):
+        return self._height
+
+    @property
+    def frame_rate(self):
+        return self._frame_rate
+
+    @property
+    def audio_sample_rate(self):
+        return self._audio_sample_rate
+
+    @property
+    def audio_channels(self):
+        return self._audio_channels
 
 class _Context(Mapping):
     """
@@ -1515,15 +1639,29 @@ def _build_file(media_reference, br_map):
     if not file_e.find("media"):
         file_media_e = _get_or_create_subelement(file_e, "media")
 
-        audio_exts = {'.wav', '.aac', '.mp3', '.aif', '.aiff', '.m4a'}
-        has_video = (os.path.splitext(url_path)[1].lower() not in audio_exts)
-        if has_video and file_media_e.find("video") is None:
-            _append_new_sub_element(file_media_e, "video")
+        try:
+            ffprobe = FFProbe(url_path)
+            ffprobe.probe()
 
-        # TODO: This is assuming all files have an audio track. Not sure what
-        # the implications of that are.
-        if file_media_e.find("audio") is None:
-            _append_new_sub_element(file_media_e, "audio")
+            if ffprobe.has_video() and file_media_e.find("video") is None:
+                _append_new_sub_element(file_media_e, "video")
+
+            # TODO: This is assuming all files have an audio track. Not sure what
+            # the implications of that are.
+            if ffprobe.has_audio() and file_media_e.find("audio") is None:
+                _append_new_sub_element(file_media_e, "audio")
+
+        except FileNotFoundError:
+            # Fallback to old behaviour
+            audio_exts = {'.wav', '.aac', '.mp3', '.aif', '.aiff', '.m4a'}
+            has_video = (os.path.splitext(url_path)[1].lower() not in audio_exts)
+            if has_video and file_media_e.find("video") is None:
+                _append_new_sub_element(file_media_e, "video")
+
+            # TODO: This is assuming all files have an audio track. Not sure what
+             # the implications of that are.
+            if file_media_e.find("audio") is None:
+                _append_new_sub_element(file_media_e, "audio")
 
     return file_e
 
