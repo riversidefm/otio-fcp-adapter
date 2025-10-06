@@ -17,6 +17,8 @@ from xml.dom import minidom
 import urllib.parse as urllib_parse
 from collections.abc import Mapping
 
+from fractions import Fraction
+
 from .. import (
     core,
     opentime,
