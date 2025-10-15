@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 from xml.etree import cElementTree
 
 from opentimelineio import (
@@ -1495,6 +1496,179 @@ class AdaptersFcp7XmlTest(unittest.TestCase, test_utils.OTIOAssertions):
         self.assertEqual(timeline.tracks[2].name, "disabled_track")
         self.assertEqual(timeline.audio_tracks()[0].name, "audio_with_disabled")
         self.assertEqual(timeline.audio_tracks()[1].name, "")
+
+
+class TestFcp7XmlFFProbeIntegration(unittest.TestCase, test_utils.OTIOAssertions):
+    """Test integration between legacy FFProbe class and new OTIO ffprobe utilities."""
+
+    def setUp(self):
+        self.adapter = adapters.from_name('fcp_xml').module()
+        self.test_media_path = "/fake/media/file.mov"
+
+    def test_legacy_ffprobe_helper_function(self):
+        """Test that _get_media_info_with_ffprobe works with legacy FFProbe class."""
+        # Mock the legacy FFProbe class
+        with unittest.mock.patch.object(self.adapter, 'FFProbe') as mock_ffprobe_class:
+            mock_ffprobe_instance = unittest.mock.Mock()
+            mock_ffprobe_class.return_value = mock_ffprobe_instance
+
+            # Set up mock return values
+            mock_ffprobe_instance.has_video.return_value = True
+            mock_ffprobe_instance.has_audio.return_value = True
+            mock_ffprobe_instance.width = 1920
+            mock_ffprobe_instance.height = 1080
+            mock_ffprobe_instance.frame_rate = 24.0
+            mock_ffprobe_instance.audio_sample_rate = 48000
+            mock_ffprobe_instance.audio_channels = 2
+
+            # Set global flag for legacy path
+            self.adapter._USE_OTIO_FFPROBE = False
+            result = self.adapter._get_media_info_with_ffprobe(self.test_media_path)
+
+            # Verify the FFProbe class was used
+            mock_ffprobe_class.assert_called_once_with(self.test_media_path)
+            mock_ffprobe_instance.probe.assert_called_once()
+
+            # Verify the returned data structure
+            expected = {
+                'has_video': True,
+                'has_audio': True,
+                'width': 1920,
+                'height': 1080,
+                'frame_rate': 24.0,
+                'audio_sample_rate': 48000,
+                'audio_channels': 2
+            }
+            self.assertEqual(result, expected)
+
+    def test_otio_ffprobe_helper_function(self):
+        """Test that _get_media_info_with_ffprobe works with OTIO Adapter methods."""
+        # Mock the OTIO Adapter static methods
+        with unittest.mock.patch.object(self.adapter, 'Adapter') as mock_adapter:
+            mock_adapter.ffprobe_get_width.return_value = 1920
+            mock_adapter.ffprobe_get_height.return_value = 1080
+            mock_adapter.ffprobe_get_framerate.return_value = 24.0
+            mock_adapter.ffprobe_get_samplerate.return_value = 48000
+            mock_adapter.ffprobe_get_channels.return_value = 2
+
+            # Set global flag for OTIO path
+            self.adapter._USE_OTIO_FFPROBE = True
+            result = self.adapter._get_media_info_with_ffprobe(self.test_media_path)
+
+            # Verify the OTIO Adapter methods were called
+            mock_adapter.ffprobe_get_width.assert_called_once_with(self.test_media_path)
+            mock_adapter.ffprobe_get_height.assert_called_once_with(self.test_media_path)
+            mock_adapter.ffprobe_get_framerate.assert_called_once_with(self.test_media_path)
+            mock_adapter.ffprobe_get_samplerate.assert_called_once_with(self.test_media_path)
+            mock_adapter.ffprobe_get_channels.assert_called_once_with(self.test_media_path)
+
+            # Verify the returned data structure
+            expected = {
+                'has_video': True,
+                'has_audio': True,
+                'width': 1920,
+                'height': 1080,
+                'frame_rate': 24.0,
+                'audio_sample_rate': 48000,
+                'audio_channels': 2
+            }
+            self.assertEqual(result, expected)
+
+    def test_otio_ffprobe_fallback_to_legacy(self):
+        """Test that OTIO ffprobe falls back to legacy when it fails."""
+        # Mock OTIO Adapter methods to raise an exception
+        with unittest.mock.patch.object(self.adapter, 'Adapter') as mock_adapter:
+            mock_adapter.ffprobe_get_width.side_effect = Exception("OTIO ffprobe failed")
+
+            # Mock the legacy FFProbe class for fallback
+            with unittest.mock.patch.object(self.adapter, 'FFProbe') as mock_ffprobe_class:
+                mock_ffprobe_instance = unittest.mock.Mock()
+                mock_ffprobe_class.return_value = mock_ffprobe_instance
+
+                mock_ffprobe_instance.has_video.return_value = True
+                mock_ffprobe_instance.has_audio.return_value = False
+                mock_ffprobe_instance.width = 720
+                mock_ffprobe_instance.height = 480
+                mock_ffprobe_instance.frame_rate = 30.0
+                mock_ffprobe_instance.audio_sample_rate = 0
+                mock_ffprobe_instance.audio_channels = 0
+
+                # Set global flag for OTIO path that should fallback to legacy
+                self.adapter._USE_OTIO_FFPROBE = True
+                result = self.adapter._get_media_info_with_ffprobe(self.test_media_path)
+
+                # Verify both paths were attempted
+                mock_adapter.ffprobe_get_width.assert_called_once_with(self.test_media_path)
+                mock_ffprobe_class.assert_called_once_with(self.test_media_path)
+                mock_ffprobe_instance.probe.assert_called_once()
+
+                # Verify fallback result
+                expected = {
+                    'has_video': True,
+                    'has_audio': False,
+                    'width': 720,
+                    'height': 480,
+                    'frame_rate': 30.0,
+                    'audio_sample_rate': 0,
+                    'audio_channels': 0
+                }
+                self.assertEqual(result, expected)
+
+    def test_write_to_string_uses_otio_ffprobe_parameter(self):
+        """Test that write_to_string respects the use_otio_ffprobe parameter."""
+        # Create a simple timeline with an external reference
+        timeline = schema.Timeline(name="Test Timeline")
+        track = schema.Track(name="V1", kind=schema.TrackKind.Video)
+        clip = schema.Clip(name="test_clip")
+
+        # Set up a proper media reference with available range
+        available_range = opentime.TimeRange(
+            start_time=opentime.RationalTime(0, 24),
+            duration=opentime.RationalTime(100, 24)
+        )
+        clip.media_reference = schema.ExternalReference(
+            target_url="file:///test/video.mov",
+            available_range=available_range
+        )
+
+        # Set up source range for the clip
+        clip.source_range = opentime.TimeRange(
+            start_time=opentime.RationalTime(0, 24),
+            duration=opentime.RationalTime(50, 24)
+        )
+
+        track.append(clip)
+        timeline.tracks.append(track)
+
+        # Mock both ffprobe paths
+        with unittest.mock.patch.object(self.adapter, '_get_media_info_with_ffprobe') as mock_get_info:
+            mock_get_info.return_value = {
+                'has_video': True,
+                'has_audio': False,
+                'width': 1920,
+                'height': 1080,
+                'frame_rate': 24.0,
+                'audio_sample_rate': 0,
+                'audio_channels': 0
+            }
+
+            # Test with use_otio_ffprobe=False (default)
+            xml_legacy = self.adapter.write_to_string(timeline, use_otio_ffprobe=False)
+            self.assertIsInstance(xml_legacy, str)
+            self.assertIn('<xmeml', xml_legacy)
+
+            # Test with use_otio_ffprobe=True
+            xml_otio = self.adapter.write_to_string(timeline, use_otio_ffprobe=True)
+            self.assertIsInstance(xml_otio, str)
+            self.assertIn('<xmeml', xml_otio)
+
+            # Verify the helper function was called twice (once for each test)
+            self.assertEqual(mock_get_info.call_count, 2)
+
+            # Both calls should just have the file path as positional argument
+            calls = mock_get_info.call_args_list
+            self.assertEqual(calls[0][0], ('/test/video.mov',))
+            self.assertEqual(calls[1][0], ('/test/video.mov',))
 
 
 if __name__ == '__main__':

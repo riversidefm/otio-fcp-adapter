@@ -25,8 +25,13 @@ from .. import (
     schema,
 )
 
+from opentimelineio.adapters import Adapter
+
 # namespace to use for metadata
 META_NAMESPACE = 'fcp_xml'
+
+# Global flag for ffprobe method selection
+_USE_OTIO_FFPROBE = False
 
 # Regex to match identifiers like clipitem-22
 ID_RE = re.compile(r"^(?P<tag>[a-zA-Z]*)-(?P<id>\d*)$")
@@ -158,6 +163,75 @@ class FFProbe:
     @property
     def audio_channels(self):
         return self._audio_channels
+
+
+# Helper functions to conditionally use OTIO ffprobe or legacy FFProbe class
+def _get_media_info_with_ffprobe(file_path):
+    """
+    Get media information using either OTIO ffprobe utilities or legacy FFProbe class.
+
+    Uses the global _USE_OTIO_FFPROBE flag to determine which method to use.
+
+    Args:
+        file_path (str): Path to the media file
+
+    Returns:
+        dict: Media information with keys: has_video, has_audio, width, height, frame_rate,
+              audio_sample_rate, audio_channels
+    """
+    global _USE_OTIO_FFPROBE
+
+    result = {
+        'has_video': False,
+        'has_audio': False,
+        'width': 0,
+        'height': 0,
+        'frame_rate': 0,
+        'audio_sample_rate': 0,
+        'audio_channels': 0
+    }
+
+    if _USE_OTIO_FFPROBE:
+        try:
+            # Use new OTIO ffprobe utilities via Adapter static methods
+            width = Adapter.ffprobe_get_width(file_path)
+            height = Adapter.ffprobe_get_height(file_path)
+            frame_rate = Adapter.ffprobe_get_framerate(file_path)
+            sample_rate = Adapter.ffprobe_get_samplerate(file_path)
+            channels = Adapter.ffprobe_get_channels(file_path)
+
+            result['has_video'] = width is not None and height is not None and frame_rate is not None
+            result['has_audio'] = sample_rate is not None and channels is not None
+            result['width'] = width or 0
+            result['height'] = height or 0
+            result['frame_rate'] = frame_rate or 0
+            result['audio_sample_rate'] = sample_rate or 0
+            result['audio_channels'] = channels or 0
+
+        except Exception:
+            # Fall back to legacy method if OTIO ffprobe fails
+            _USE_OTIO_FFPROBE = False
+            return _get_media_info_with_ffprobe(file_path)
+    else:
+        # Use legacy FFProbe class
+        try:
+            ffprobe = FFProbe(file_path)
+            ffprobe.probe()
+
+            result['has_video'] = ffprobe.has_video()
+            result['has_audio'] = ffprobe.has_audio()
+            result['width'] = ffprobe.width
+            result['height'] = ffprobe.height
+            result['frame_rate'] = float(ffprobe.frame_rate) if ffprobe.frame_rate else 0
+            result['audio_sample_rate'] = ffprobe.audio_sample_rate
+            result['audio_channels'] = ffprobe.audio_channels
+
+        except Exception:
+            # If both methods fail, return empty result
+            pass
+
+    return result
+
 
 class _Context(Mapping):
     """
@@ -1642,19 +1716,19 @@ def _build_file(media_reference, br_map):
         file_media_e = _get_or_create_subelement(file_e, "media")
 
         try:
-            ffprobe = FFProbe(url_path)
-            ffprobe.probe()
+            # Use conditional ffprobe logic
+            media_info = _get_media_info_with_ffprobe(url_path)
 
-            if ffprobe.has_video() and file_media_e.find("video") is None:
+            if media_info['has_video'] and file_media_e.find("video") is None:
                 _append_new_sub_element(file_media_e, "video")
 
             # TODO: This is assuming all files have an audio track. Not sure what
             # the implications of that are.
-            if ffprobe.has_audio() and file_media_e.find("audio") is None:
+            if media_info['has_audio'] and file_media_e.find("audio") is None:
                 audio = _append_new_sub_element(file_media_e, "audio")
-                _append_new_sub_element(audio, "channelcount", text=str(ffprobe.audio_channels))
+                _append_new_sub_element(audio, "channelcount", text=str(media_info['audio_channels']))
                 media_characteristics = _append_new_sub_element(audio, "samplecharacteristics")
-                _append_new_sub_element(media_characteristics, "samplerate", text=str(ffprobe.audio_sample_rate))
+                _append_new_sub_element(media_characteristics, "samplerate", text=str(media_info['audio_sample_rate']))
 
         except FileNotFoundError:
             # Fallback to old behaviour
@@ -2148,7 +2222,11 @@ def read_from_string(input_str):
         raise ValueError('No top-level sequences found')
 
 
-def write_to_string(input_otio):
+def write_to_string(input_otio, use_otio_ffprobe=False):
+    # Set global ffprobe preference for this operation
+    global _USE_OTIO_FFPROBE
+    _USE_OTIO_FFPROBE = use_otio_ffprobe
+
     tree_e = cElementTree.Element('xmeml', version="4")
     project_e = _append_new_sub_element(tree_e, 'project')
     _append_new_sub_element(project_e, 'name', text=input_otio.name)
@@ -2162,9 +2240,7 @@ def write_to_string(input_otio):
             duration=input_otio.duration()
         )
         children_e.append(
-            _build_sequence_for_timeline(
-                input_otio, timeline_range, br_map
-            )
+            _build_sequence_for_timeline(input_otio, timeline_range, br_map)
         )
     elif isinstance(input_otio, schema.SerializableCollection):
         children_e.extend(
