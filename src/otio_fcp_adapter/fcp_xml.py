@@ -6,6 +6,7 @@
 import collections
 import functools
 import itertools
+import logging
 import math
 import os
 import re
@@ -30,6 +31,9 @@ META_NAMESPACE = 'fcp_xml'
 
 # Regex to match identifiers like clipitem-22
 ID_RE = re.compile(r"^(?P<tag>[a-zA-Z]*)-(?P<id>\d*)$")
+
+# Logger for this module
+log = logging.getLogger(__name__)
 
 
 # ---------
@@ -1483,7 +1487,27 @@ def _build_timecode(time, fps, drop_frame=False, additional_metadata=None):
 
     # Get the time values
     tc_time = opentime.RationalTime(time.value_rescaled_to(fps), tc_fps)
-    tc_string = opentime.to_timecode(tc_time, tc_fps, drop_frame)
+
+    # Try to generate SMPTE timecode, but fall back to manual generation
+    # if the frame rate is not supported
+    try:
+        tc_string = opentime.to_timecode(tc_time, tc_fps, drop_frame)
+    except ValueError as e:
+        # Frame rate not supported by SMPTE timecode, generate manually
+        log.warning(
+            "Frame rate %s fps is not supported by SMPTE timecode "
+            "(error: %s). Generating manual timecode string as fallback.",
+            tc_fps, e
+        )
+        frame_number = int(round(time.value))
+        hours = frame_number // (3600 * int(fps))
+        frame_number %= (3600 * int(fps))
+        minutes = frame_number // (60 * int(fps))
+        frame_number %= (60 * int(fps))
+        seconds = frame_number // int(fps)
+        frames = frame_number % int(fps)
+        tc_string = f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
+        drop_frame = False  # Can't use drop frame for non-standard rates
 
     _append_new_sub_element(tc_element, "string", text=tc_string)
 
@@ -2020,8 +2044,22 @@ def _build_timecode_from_metadata(time, tc_metadata=None):
             tc_metadata["timebase"], _bool_value(tc_metadata["ntsc"])
         )
     except KeyError:
-        # Default to the rate in the start time
+        # Default to the rate in the start time, but check if it's an audio
+        # sample rate (which can't be used for SMPTE timecode)
         tc_rate = time.rate
+
+        # Audio sample rates are typically >= 44100 Hz
+        # SMPTE timecode rates are typically <= 120 fps
+        # If we detect an audio sample rate, use a sensible default video rate
+        if tc_rate >= 1000:
+            # This is likely an audio sample rate, not a video frame rate
+            # Default to 24 fps as a reasonable fallback for timecode
+            log.warning(
+                "Audio sample rate (%s Hz) detected where video frame rate "
+                "expected for timecode generation. Using 24 fps as fallback.",
+                tc_rate
+            )
+            tc_rate = 24
 
     drop_frame = (tc_metadata.get("displayformat", "NDF") == "DF")
 
