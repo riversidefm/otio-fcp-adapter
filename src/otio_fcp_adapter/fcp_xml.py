@@ -1540,8 +1540,13 @@ def _build_item_timings(
     source_end = (item.source_range.end_time_exclusive() - timecode)
     source_end = source_end.rescaled_to(item_rate)
 
-    start = f'{timeline_range.start_time.value:.0f}'
-    end = f'{timeline_range.end_time_exclusive().value:.0f}'
+    # FIX: Convert timeline_range to item_rate so start/end use the same timebase
+    # as the <rate> element (which specifies item_rate, e.g. 48000 for audio)
+    timeline_start_in_item_rate = timeline_range.start_time.rescaled_to(item_rate)
+    timeline_end_in_item_rate = timeline_range.end_time_exclusive().rescaled_to(item_rate)
+
+    start = f'{timeline_start_in_item_rate.value:.0f}'
+    end = f'{timeline_end_in_item_rate.value:.0f}'
 
     item_e.append(_build_rate(item_rate))
 
