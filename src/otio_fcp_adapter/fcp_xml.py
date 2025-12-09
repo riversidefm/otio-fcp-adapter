@@ -1534,7 +1534,7 @@ def _build_item_timings(
     # Premiere expects all clipitem timing values (start, end, in, out, duration)
     # to be expressed in the sequence's frame rate, even for audio clips.
     sequence_rate = timeline_range.start_time.rate
-    
+
     # source_start is absolute time taking into account the timecode of the
     # media. But xml regards the source in point from the start of the media.
     # So we subtract the media timecode, then express in sequence rate.
@@ -1689,14 +1689,26 @@ def _build_file(media_reference, br_map):
                 _append_new_sub_element(media_characteristics, "samplerate", text=str(ffprobe.audio_sample_rate))
 
         except FileNotFoundError:
-            # Fallback to old behaviour
+            # Fallback - try to get dimensions from metadata
             audio_exts = {'.wav', '.aac', '.mp3', '.aif', '.aiff', '.m4a'}
             has_video = (os.path.splitext(url_path)[1].lower() not in audio_exts)
             if has_video and file_media_e.find("video") is None:
-                _append_new_sub_element(file_media_e, "video")
+                video_e = _append_new_sub_element(file_media_e, "video")
+                # Try to add samplecharacteristics from AAF metadata
+                try:
+                    aaf_meta = media_reference.metadata.get('AAF', {})
+                    essence = aaf_meta.get('EssenceDescription', {})
+                    width = essence.get('StoredWidth')
+                    height = essence.get('StoredHeight')
+                    if width and height:
+                        sample_char = _append_new_sub_element(video_e, "samplecharacteristics")
+                        _append_new_sub_element(sample_char, "width", text=str(int(width)))
+                        _append_new_sub_element(sample_char, "height", text=str(int(height)))
+                except (AttributeError, KeyError, TypeError):
+                    pass
 
             # TODO: This is assuming all files have an audio track. Not sure what
-             # the implications of that are.
+            # the implications of that are.
             if file_media_e.find("audio") is None:
                 _append_new_sub_element(file_media_e, "audio")
 
@@ -1751,6 +1763,168 @@ def _build_transition_item(
         _append_new_sub_element(effect_e, 'mediatype', text='video')
 
     return transition_e
+
+
+def _build_motion_effect_filters(clip_item, br_map):
+    """
+    Build FCP7 XML filter elements for OTIO video effects (scale, crop, position).
+
+    Returns a list of filter XML elements.
+    """
+    filters = []
+
+    # Get canvas size from br_map
+    canvas_size = br_map.get('_canvas_size', (1920, 1080))
+    seq_width, seq_height = canvas_size
+
+    # Get original clip dimensions from media reference metadata
+    try:
+        essence = clip_item.media_reference.metadata.get('AAF', {}).get('EssenceDescription', {})
+        clip_width = essence.get('StoredWidth', seq_width)
+        clip_height = essence.get('StoredHeight', seq_height)
+    except (AttributeError, KeyError):
+        clip_width = seq_width
+        clip_height = seq_height
+
+    # Collect effect values
+    scale_width = None
+    scale_height = None
+    crop_left = crop_right = crop_top = crop_bottom = 0
+    position_x = position_y = None
+    rotation = 0
+
+    for effect in clip_item.effects:
+        effect_type = type(effect).__name__
+
+        if effect_type == 'VideoScale':
+            scale_width = getattr(effect, 'width', None)
+            scale_height = getattr(effect, 'height', None)
+        elif effect_type == 'VideoCrop':
+            crop_left = getattr(effect, 'left', 0)
+            crop_right = getattr(effect, 'right', 0)
+            crop_top = getattr(effect, 'top', 0)
+            crop_bottom = getattr(effect, 'bottom', 0)
+        elif effect_type == 'VideoPosition':
+            position_x = getattr(effect, 'x', None)
+            position_y = getattr(effect, 'y', None)
+        elif effect_type == 'VideoRotate':
+            rotation = getattr(effect, 'angle', 0)
+
+    # Only build filter if we have any effects
+    has_motion = (scale_width is not None or scale_height is not None or
+                  crop_left or crop_right or crop_top or crop_bottom or
+                  position_x is not None or position_y is not None or
+                  rotation != 0)
+
+    if not has_motion:
+        return filters
+
+    # Build Basic Motion filter
+    filter_e = cElementTree.Element('filter')
+    effect_e = cElementTree.SubElement(filter_e, 'effect')
+    _append_new_sub_element(effect_e, 'name', text='Basic Motion')
+    _append_new_sub_element(effect_e, 'effectid', text='basic')
+    _append_new_sub_element(effect_e, 'effectcategory', text='motion')
+    _append_new_sub_element(effect_e, 'effecttype', text='motion')
+    _append_new_sub_element(effect_e, 'mediatype', text='video')
+
+    # Scale parameter (width percentage)
+    if scale_width is not None:
+        scale_pct = (scale_width / clip_width) * 100
+    else:
+        scale_pct = 100
+
+    scale_param = cElementTree.SubElement(effect_e, 'parameter')
+    _append_new_sub_element(scale_param, 'parameterid', text='scale')
+    _append_new_sub_element(scale_param, 'name', text='Scale')
+    _append_new_sub_element(scale_param, 'value', text=f'{scale_pct:.6g}')
+
+    # Center (position) parameter - normalized offset from canvas center
+    # ork position is TOP-LEFT corner of the VISIBLE (post-crop) clip
+    if position_x is not None and position_y is not None:
+        # Get the scaled clip dimensions (pre-crop)
+        scaled_width = scale_width if scale_width is not None else clip_width
+        scaled_height = scale_height if scale_height is not None else clip_height
+
+        # Crop values from ork/OTIO are already in SCALED pixels
+        # (not original source pixels)
+        left_crop_scaled = crop_left
+        right_crop_scaled = crop_right
+        top_crop_scaled = crop_top
+        bottom_crop_scaled = crop_bottom
+
+        # Visible size is scaled size minus crop
+        visible_width = scaled_width - left_crop_scaled - right_crop_scaled
+        visible_height = scaled_height - top_crop_scaled - bottom_crop_scaled
+
+        # ork position is top-left of VISIBLE clip, convert to visible center
+        visible_center_x = position_x + visible_width / 2
+        visible_center_y = position_y + visible_height / 2
+
+        # Normalize relative to canvas center
+        # FCP7 horiz/vert: (offset_from_center) / canvas_dimension
+        horiz = (visible_center_x - seq_width / 2) / seq_width
+        vert = (visible_center_y - seq_height / 2) / seq_height
+
+        # FCP7 applies position BEFORE crop, so we need to compensate
+        # for asymmetric cropping to get the visible clip in the right spot
+        # Left crop shifts visible right, so shift position left (and vice versa)
+        horiz -= (left_crop_scaled - right_crop_scaled) / seq_width
+        vert -= (top_crop_scaled - bottom_crop_scaled) / seq_height
+    else:
+        horiz = 0
+        vert = 0
+
+    center_param = cElementTree.SubElement(effect_e, 'parameter')
+    _append_new_sub_element(center_param, 'parameterid', text='center')
+    _append_new_sub_element(center_param, 'name', text='Center')
+    value_e = cElementTree.SubElement(center_param, 'value')
+    _append_new_sub_element(value_e, 'horiz', text=f'{horiz:.6g}')
+    _append_new_sub_element(value_e, 'vert', text=f'{vert:.6g}')
+
+    # Crop parameters (percentages)
+    crop_left_pct = (crop_left / clip_width) * 100 if clip_width else 0
+    crop_right_pct = (crop_right / clip_width) * 100 if clip_width else 0
+    crop_top_pct = (crop_top / clip_height) * 100 if clip_height else 0
+    crop_bottom_pct = (crop_bottom / clip_height) * 100 if clip_height else 0
+
+    for crop_id, crop_name, crop_val in [
+        ('leftcrop', 'Left', crop_left_pct),
+        ('topcrop', 'Top', crop_top_pct),
+        ('rightcrop', 'Right', crop_right_pct),
+        ('bottomcrop', 'Bottom', crop_bottom_pct),
+    ]:
+        crop_param = cElementTree.SubElement(effect_e, 'parameter')
+        _append_new_sub_element(crop_param, 'parameterid', text=crop_id)
+        _append_new_sub_element(crop_param, 'name', text=crop_name)
+        _append_new_sub_element(crop_param, 'value', text=f'{crop_val:.6g}')
+
+    filters.append(filter_e)
+
+    # Build Distort filter if non-uniform scaling
+    if scale_width is not None and scale_height is not None:
+        height_pct = (scale_height / clip_height) * 100
+        if abs(height_pct - scale_pct) > 0.01:  # Non-uniform scale
+            aspect = ((height_pct - scale_pct) / height_pct) * 100
+
+            distort_filter = cElementTree.Element('filter')
+            distort_effect = cElementTree.SubElement(distort_filter, 'effect')
+            _append_new_sub_element(distort_effect, 'name', text='Distort')
+            _append_new_sub_element(distort_effect, 'effectid', text='deformation')
+            _append_new_sub_element(distort_effect, 'effectcategory', text='motion')
+            _append_new_sub_element(distort_effect, 'effecttype', text='motion')
+            _append_new_sub_element(distort_effect, 'mediatype', text='video')
+
+            aspect_param = cElementTree.SubElement(distort_effect, 'parameter')
+            _append_new_sub_element(aspect_param, 'parameterid', text='aspect')
+            _append_new_sub_element(aspect_param, 'name', text='Aspect')
+            _append_new_sub_element(aspect_param, 'valuemin', text='-10000')
+            _append_new_sub_element(aspect_param, 'valuemax', text='10000')
+            _append_new_sub_element(aspect_param, 'value', text=f'{aspect:.6g}')
+
+            filters.append(distort_filter)
+
+    return filters
 
 
 @_backreference_build("clipitem")
@@ -1864,6 +2038,10 @@ def _build_clip_item(clip_item, timeline_range, transition_offsets, br_map):
         transition_offsets,
         timecode
     )
+
+    # Add motion effect filters (scale, crop, position) if present
+    for filter_e in _build_motion_effect_filters(clip_item, br_map):
+        clip_item_e.append(filter_e)
 
     return clip_item_e
 
@@ -2115,6 +2293,12 @@ def _build_sequence_for_stack(stack, timeline_range, br_map):
 
 
 def _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map, canvas_size=None):
+    # Store canvas_size in br_map for effect conversion, default to 1920x1080
+    if canvas_size:
+        br_map['_canvas_size'] = (canvas_size.x, canvas_size.y)
+    else:
+        br_map['_canvas_size'] = (1920, 1080)
+
     _append_new_sub_element(sequence_e, 'name', text=stack.name)
     _append_new_sub_element(
         sequence_e, 'duration',
@@ -2135,6 +2319,7 @@ def _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map, c
         vsubchar_e = _get_or_create_subelement(vformat_e, "samplecharacteristics")
         _append_new_sub_element(vsubchar_e, "width", text=str(int(canvas_size.x)))
         _append_new_sub_element(vsubchar_e, "height", text=str(int(canvas_size.y)))
+        _append_new_sub_element(vsubchar_e, "pixelaspectratio", text="square")
 
     # XXX: Due to the way that backreferences are created later on, the XML
     #      is assumed to have its video tracks serialized before its audio
@@ -2145,12 +2330,19 @@ def _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map, c
     media_e.clear()
     media_e.extend([video_e, audio_e])
 
-    for track in stack:
+    # Collect video and audio tracks separately
+    video_tracks = [t for t in stack if t.kind == schema.TrackKind.Video]
+    audio_tracks = [t for t in stack if t.kind == schema.TrackKind.Audio]
+
+    # FCP7 expects tracks in bottom-to-top order (Track 1 = bottom layer)
+    # OTIO stacks typically have topmost track first, so reverse video tracks
+    for track in reversed(video_tracks):
         track_elements = _build_top_level_track(track, track_rate, br_map)
-        if track.kind == schema.TrackKind.Video:
-            video_e.append(track_elements)
-        elif track.kind == schema.TrackKind.Audio:
-            audio_e.append(track_elements)
+        video_e.append(track_elements)
+
+    for track in audio_tracks:
+        track_elements = _build_top_level_track(track, track_rate, br_map)
+        audio_e.append(track_elements)
 
     for marker in stack.markers:
         sequence_e.append(_build_marker(marker))
@@ -2195,10 +2387,7 @@ def read_from_string(input_str):
 
 
 def write_to_string(input_otio):
-    tree_e = cElementTree.Element('xmeml', version="4")
-    project_e = _append_new_sub_element(tree_e, 'project')
-    _append_new_sub_element(project_e, 'name', text=input_otio.name)
-    children_e = _append_new_sub_element(project_e, 'children')
+    tree_e = cElementTree.Element('xmeml', version="5")
 
     br_map = collections.defaultdict(dict)
 
@@ -2207,12 +2396,17 @@ def write_to_string(input_otio):
             start_time=input_otio.global_start_time,
             duration=input_otio.duration()
         )
-        children_e.append(
+        # Append sequence directly to xmeml (version 5 style)
+        tree_e.append(
             _build_sequence_for_timeline(
                 input_otio, timeline_range, br_map
             )
         )
     elif isinstance(input_otio, schema.SerializableCollection):
+        # For collections, use the project wrapper
+        project_e = _append_new_sub_element(tree_e, 'project')
+        _append_new_sub_element(project_e, 'name', text=input_otio.name)
+        children_e = _append_new_sub_element(project_e, 'children')
         children_e.extend(
             _build_collection(input_otio, br_map)
         )
