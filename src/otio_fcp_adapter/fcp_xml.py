@@ -1862,15 +1862,16 @@ def _build_motion_effect_filters(clip_item, br_map):
         visible_center_y = position_y + visible_height / 2
 
         # Normalize relative to canvas center
-        # FCP7 horiz/vert: (offset_from_center) / canvas_dimension
-        horiz = (visible_center_x - seq_width / 2) / seq_width
-        vert = (visible_center_y - seq_height / 2) / seq_height
+        # FCP7 horiz/vert: position is interpreted relative to SOURCE dimensions
+        # When scaled >100%, the effective offset is multiplied by scale factor
+        horiz = (visible_center_x - seq_width / 2) / clip_width
+        vert = (visible_center_y - seq_height / 2) / clip_height
 
         # FCP7 applies position BEFORE crop, so we need to compensate
         # for asymmetric cropping to get the visible clip in the right spot
         # Left crop shifts visible right, so shift position left (and vice versa)
-        horiz -= (left_crop_scaled - right_crop_scaled) / seq_width
-        vert -= (top_crop_scaled - bottom_crop_scaled) / seq_height
+        horiz -= (left_crop_scaled - right_crop_scaled) / clip_width
+        vert -= (top_crop_scaled - bottom_crop_scaled) / clip_height
     else:
         horiz = 0
         vert = 0
@@ -1882,11 +1883,14 @@ def _build_motion_effect_filters(clip_item, br_map):
     _append_new_sub_element(value_e, 'horiz', text=f'{horiz:.6g}')
     _append_new_sub_element(value_e, 'vert', text=f'{vert:.6g}')
 
-    # Crop parameters (percentages)
-    crop_left_pct = (crop_left / clip_width) * 100 if clip_width else 0
-    crop_right_pct = (crop_right / clip_width) * 100 if clip_width else 0
-    crop_top_pct = (crop_top / clip_height) * 100 if clip_height else 0
-    crop_bottom_pct = (crop_bottom / clip_height) * 100 if clip_height else 0
+    # Crop parameters (percentages relative to SCALED size, not original)
+    # Crop values from ork are in scaled pixels
+    scaled_w = scale_width if scale_width is not None else clip_width
+    scaled_h = scale_height if scale_height is not None else clip_height
+    crop_left_pct = (crop_left / scaled_w) * 100 if scaled_w else 0
+    crop_right_pct = (crop_right / scaled_w) * 100 if scaled_w else 0
+    crop_top_pct = (crop_top / scaled_h) * 100 if scaled_h else 0
+    crop_bottom_pct = (crop_bottom / scaled_h) * 100 if scaled_h else 0
 
     for crop_id, crop_name, crop_val in [
         ('leftcrop', 'Left', crop_left_pct),
@@ -2334,9 +2338,7 @@ def _add_stack_elements_to_sequence(stack, sequence_e, timeline_range, br_map, c
     video_tracks = [t for t in stack if t.kind == schema.TrackKind.Video]
     audio_tracks = [t for t in stack if t.kind == schema.TrackKind.Audio]
 
-    # FCP7 expects tracks in bottom-to-top order (Track 1 = bottom layer)
-    # OTIO stacks typically have topmost track first, so reverse video tracks
-    for track in reversed(video_tracks):
+    for track in video_tracks:
         track_elements = _build_top_level_track(track, track_rate, br_map)
         video_e.append(track_elements)
 
