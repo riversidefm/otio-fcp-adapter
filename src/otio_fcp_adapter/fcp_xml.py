@@ -1530,25 +1530,26 @@ def _build_item_timings(
     transition_offsets,
     timecode
 ):
+    # Use SEQUENCE rate for clipitem timing, not the clip's native rate.
+    # Premiere expects all clipitem timing values (start, end, in, out, duration)
+    # to be expressed in the sequence's frame rate, even for audio clips.
+    sequence_rate = timeline_range.start_time.rate
+    
     # source_start is absolute time taking into account the timecode of the
     # media. But xml regards the source in point from the start of the media.
-    # So we subtract the media timecode.
-    item_rate = item.source_range.start_time.rate
+    # So we subtract the media timecode, then express in sequence rate.
     source_start = (item.source_range.start_time - timecode)
-    source_start = source_start.rescaled_to(item_rate)
+    source_start = source_start.rescaled_to(sequence_rate)
 
     source_end = (item.source_range.end_time_exclusive() - timecode)
-    source_end = source_end.rescaled_to(item_rate)
+    source_end = source_end.rescaled_to(sequence_rate)
 
-    # FIX: Convert timeline_range to item_rate so start/end use the same timebase
-    # as the <rate> element (which specifies item_rate, e.g. 48000 for audio)
-    timeline_start_in_item_rate = timeline_range.start_time.rescaled_to(item_rate)
-    timeline_end_in_item_rate = timeline_range.end_time_exclusive().rescaled_to(item_rate)
+    # start/end are timeline positions, already in sequence rate
+    start = f'{timeline_range.start_time.value:.0f}'
+    end = f'{timeline_range.end_time_exclusive().value:.0f}'
 
-    start = f'{timeline_start_in_item_rate.value:.0f}'
-    end = f'{timeline_end_in_item_rate.value:.0f}'
-
-    item_e.append(_build_rate(item_rate))
+    # Write the sequence rate as the clipitem's rate
+    item_e.append(_build_rate(sequence_rate))
 
     if transition_offsets[0] is not None:
         start = '-1'
@@ -1557,9 +1558,11 @@ def _build_item_timings(
         end = '-1'
         source_end += transition_offsets[1]
 
+    # Duration also in sequence rate
+    duration_in_seq_rate = item.source_range.duration.rescaled_to(sequence_rate)
     _append_new_sub_element(
         item_e, 'duration',
-        text=f'{item.source_range.duration.value:.0f}'
+        text=f'{duration_in_seq_rate.value:.0f}'
     )
     _append_new_sub_element(item_e, 'start', text=start)
     _append_new_sub_element(item_e, 'end', text=end)
